@@ -48,24 +48,10 @@ pending -> submitted -> [consensus review] -> approved -> released
                     (after max_disputes_per_milestone rejections)
                               v
                           disputed -> (mutual_resolve_dispute, 2-of-2) -> approved | rejected
-
-Anti-abuse properties
-----------------------
-- Rubric is immutable after deployment (no `set_description`).
-- Only the grantee can submit evidence; only funder or grantee can trigger
-  a release (and only after consensus-approval already happened).
-- A milestone can't flip-flop forever: after `max_disputes_per_milestone`
-  automated rejections it moves to a terminal `disputed` state that
-  requires *both* parties to explicitly agree (2-of-2 vote) on an outcome,
-  preventing either side from unilaterally stalling or rug-pulling funds.
-- Amounts are fixed at deployment per milestone, so a compromised or
-  malicious leader validator cannot redirect an arbitrary amount --
-  the JSON schema constrains the leader to a boolean decision, and the
-  payout amount is read from immutable contract state, not from the LLM
-  output.
 """
 
 from genlayer import *
+from genlayer.py.storage import *
 from dataclasses import dataclass
 import json
 import typing
@@ -144,9 +130,9 @@ class MilestoneGrantEscrow(gl.Contract):
     # Funding
     # ------------------------------------------------------------------
 
-    @gl.public.write.payable
+    @gl.public.write
     def fund(self) -> None:
-        """Anyone can top up the escrow. Native value is auto-credited to
+        """Anyone can top up the escrow. The paid value is automatically added to
         the contract's ghost-contract balance via gl.message.value."""
         pass
 
@@ -214,7 +200,7 @@ class MilestoneGrantEscrow(gl.Contract):
         m = self._milestone_at(index)
         if m.status != MilestoneStatus.SUBMITTED:
             raise gl.vm.UserError(
-                f"milestone {index} is not awaiting review (status='{m.status}')"
+                f"milestone {index} is not in submitted status (status='{m.status}')"
             )
 
         description = m.description
@@ -243,8 +229,14 @@ must be false."""
             raw = gl.exec_prompt(prompt)
             cleaned = raw.replace("```json", "").replace("```", "").strip()
             parsed = json.loads(cleaned)
+            # Require an actual boolean; do not coerce strings/ints.
+            if not isinstance(parsed.get("approved"), bool):
+                raise ValueError(
+                    "approved must be an actual boolean, "
+                    f"got {type(parsed.get('approved')).__name__}"
+                )
             normalized = {
-                "approved": bool(parsed["approved"]),
+                "approved": parsed["approved"],
                 "rationale": str(parsed["rationale"])[:500],
             }
             return json.dumps(normalized, sort_keys=True)
@@ -267,7 +259,16 @@ must be false."""
         m.review_count = u32(int(m.review_count) + 1)
         m.rationale = parsed["rationale"]
 
-        if parsed["approved"]:
+        # Validate that the model's approval value is an actual boolean
+        # before changing payout eligibility.
+        approved = parsed.get("approved")
+        if not isinstance(approved, bool):
+            raise gl.vm.UserError(
+                "model approval value must be an actual boolean, "
+                f"got {type(approved).__name__}"
+            )
+
+        if approved:
             m.status = MilestoneStatus.APPROVED
         elif int(m.review_count) >= int(self.max_disputes_per_milestone):
             m.status = MilestoneStatus.DISPUTED
@@ -280,9 +281,10 @@ must be false."""
 
     @gl.public.write
     def release_milestone(self, index: int) -> None:
+        """Funder or grantee can trigger payout once the milestone is approved."""
         sender = gl.message.sender_address
         if sender != self.funder and sender != self.grantee:
-            raise gl.vm.UserError("only funder or grantee can trigger release")
+            raise gl.vm.UserError("only the funder or grantee can release a milestone")
 
         m = self._milestone_at(index)
         if m.status != MilestoneStatus.APPROVED:
@@ -290,31 +292,29 @@ must be false."""
                 f"milestone {index} is not approved (status='{m.status}')"
             )
         if self.balance < m.amount:
-            raise gl.vm.UserError("escrow balance is insufficient for this payout")
+            raise gl.vm.UserError("escrow is underfunded for this milestone")
 
         m.status = MilestoneStatus.RELEASED
         recipient = gl.ContractAt(self.grantee)
         recipient.emit_transfer(value=int(m.amount))
 
     # ------------------------------------------------------------------
-    # Deadlock-breaking: 2-of-2 dispute resolution
+    # Dispute resolution (2-of-2 mutual vote)
     # ------------------------------------------------------------------
 
     @gl.public.write
     def mutual_resolve_dispute(self, index: int, approve: bool) -> None:
-        """After a milestone has been automatically rejected
-        max_disputes_per_milestone times, consensus review stops and the
-        milestone becomes 'disputed'. Escaping that state requires both
-        the funder and the grantee to independently agree on the same
-        outcome -- this prevents a single party from stalling funds
-        forever or forcing an outcome the other party never consented to."""
+        """Funder or grantee casts a vote to resolve a disputed milestone.
+        Both parties must agree for the status to change."""
         sender = gl.message.sender_address
-        if sender not in (self.funder, self.grantee):
-            raise gl.vm.UserError("only funder or grantee can vote on a dispute")
+        if sender != self.funder and sender != self.grantee:
+            raise gl.vm.UserError("only the funder or grantee can vote on a dispute")
 
         m = self._milestone_at(index)
         if m.status != MilestoneStatus.DISPUTED:
-            raise gl.vm.UserError(f"milestone {index} is not in disputed status")
+            raise gl.vm.UserError(
+                f"milestone {index} is not in disputed status"
+            )
 
         vote = "approve" if approve else "reject"
         idx = u32(index)
@@ -344,20 +344,20 @@ must be false."""
     @gl.public.write
     def withdraw_surplus(self, amount: int) -> None:
         """Lets the funder reclaim balance that isn't earmarked for any
-        pending/submitted/approved milestone (e.g. leftover after a
-        milestone is permanently rejected, or funds sent in excess)."""
+        milestone that can still become payable (pending, submitted,
+        approved, rejected, or disputed). Only released milestones free
+        their amount; surplus is only the truly uncommitted balance."""
         if gl.message.sender_address != self.funder:
             raise gl.vm.UserError("only the funder can withdraw surplus")
         if amount <= 0:
             raise gl.vm.UserError("amount must be positive")
 
+        # Keep funds reserved for every milestone that can still become
+        # payable, including rejected (can be resubmitted) and disputed
+        # (can be mutually resolved to approved).
         committed = u256(0)
         for m in self.milestones:
-            if m.status in (
-                MilestoneStatus.PENDING,
-                MilestoneStatus.SUBMITTED,
-                MilestoneStatus.APPROVED,
-            ):
+            if m.status != MilestoneStatus.RELEASED:
                 committed += m.amount
 
         available = int(self.balance) - int(committed)

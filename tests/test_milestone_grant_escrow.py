@@ -293,3 +293,61 @@ def test_only_funder_can_withdraw_surplus(direct_vm, direct_deploy, direct_alice
     with direct_vm.prank(direct_alice):
         with direct_vm.expect_revert():
             contract.withdraw_surplus(100)
+
+
+def test_withdraw_surplus_blocked_while_rejected(direct_vm, direct_deploy, direct_alice):
+    """Funds for a rejected milestone must stay reserved (it can still be
+    resubmitted and later become payable)."""
+    contract = _deploy(direct_deploy, direct_alice, amounts=[1000, 2000])
+    contract.fund(value=4000)  # 1000 surplus over the 3000 committed
+
+    with direct_vm.prank(direct_alice):
+        contract.submit_milestone(0, "https://github.com/example/empty")
+    direct_vm.mock_web(r"empty", {"status": 200, "body": ""})
+    direct_vm.mock_llm(r"ACCEPTANCE RUBRIC", _reject_json())
+    contract.review_milestone(0)
+    assert contract.get_milestone(0)["status"] == "rejected"
+
+    # Only the true surplus (1000) is withdrawable; the rejected milestone
+    # amount remains reserved.
+    with direct_vm.expect_revert():
+        contract.withdraw_surplus(2000)
+    contract.withdraw_surplus(1000)
+    assert contract.total_escrowed() == 3000
+
+
+def test_withdraw_surplus_blocked_while_disputed(direct_vm, direct_deploy, direct_alice):
+    """Funds for a disputed milestone must stay reserved (it can still be
+    mutually resolved to approved and become payable)."""
+    contract = _deploy(direct_deploy, direct_alice, amounts=[1000, 2000], max_disputes=1)
+    contract.fund(value=4000)
+
+    with direct_vm.prank(direct_alice):
+        contract.submit_milestone(0, "https://github.com/example/empty")
+    direct_vm.mock_web(r"empty", {"status": 200, "body": ""})
+    direct_vm.mock_llm(r"ACCEPTANCE RUBRIC", _reject_json())
+    contract.review_milestone(0)
+    assert contract.get_milestone(0)["status"] == "disputed"
+
+    with direct_vm.expect_revert():
+        contract.withdraw_surplus(2000)
+    contract.withdraw_surplus(1000)
+    assert contract.total_escrowed() == 3000
+
+
+def test_review_rejects_non_boolean_approval(direct_vm, direct_deploy, direct_alice):
+    """Model approval value must be an actual boolean before payout
+    eligibility is changed."""
+    contract = _deploy(direct_deploy, direct_alice)
+    with direct_vm.prank(direct_alice):
+        contract.submit_milestone(0, "https://github.com/example/gltool")
+
+    direct_vm.mock_web(r"gltool", {"status": 200, "body": "ok"})
+    # Non-boolean approval must cause the review to revert.
+    direct_vm.mock_llm(
+        r"ACCEPTANCE RUBRIC",
+        json.dumps({"approved": "yes", "rationale": "looks fine"}),
+    )
+
+    with direct_vm.expect_revert():
+        contract.review_milestone(0)
